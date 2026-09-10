@@ -1,0 +1,134 @@
+name: GalleyTeX inbox
+
+# Batch pipeline for an editorial office, no local software needed:
+#   inbox/*.docx  -> converted headlessly by GalleyTeX (same code path as the web app) -> LaTeX project -> XeLaTeX -> PDF
+#   inbox/*.zip   -> a project exported from the web app (after manual proofreading) -> XeLaTeX -> PDF
+# Every manuscript gets its own folder in the "galleytex-output" artifact:
+#   project.zip (LaTeX project), ui_report.json (recognised metadata + checklist), <name>.pdf, main.log
+# Venue details for the .docx conversions come from venue.json at the repository root.
+#
+# On push only the files added or changed in that push are processed; "Run workflow" reprocesses all of inbox/.
+# Keep this in a PRIVATE repository: manuscripts are confidential.
+
+on:
+  push:
+    paths: ["inbox/**", "venue.json"]
+  workflow_dispatch:
+
+env:
+  APP_REPO: SHELLY000/wordtolatexZL   # public repository that holds the converter
+  APP_REF: v0.3.1                     # converter version; bump when a new GalleyTeX release is published
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch the GalleyTeX converter
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.APP_REF }}
+          path: app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build the converter
+        run: cd app && npm ci --no-audit --no-fund && npm run build
+
+      - name: Install XeLaTeX (acmart fonts + CJK)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-xetex texlive-latex-extra texlive-fonts-recommended texlive-fonts-extra \
+            texlive-bibtex-extra texlive-lang-chinese latexmk fonts-linuxlibertine fonts-noto-cjk jq
+
+      - name: Convert and compile
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          shopt -s nullglob nocaseglob
+          # --- which files to process ---
+          if [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && ! echo "$BEFORE" | grep -q '^0*$' && git cat-file -e "$BEFORE" 2>/dev/null \
+             && ! git diff --name-only "$BEFORE" "$AFTER" | grep -qx 'venue.json'; then
+            mapfile -t files < <(git diff --name-only --diff-filter=AM "$BEFORE" "$AFTER" -- 'inbox/*.docx' 'inbox/*.zip' 'inbox/*.DOCX' 'inbox/*.ZIP')
+          else
+            files=(inbox/*.docx inbox/*.zip)
+          fi
+          if [ ${#files[@]} -eq 0 ]; then echo "::warning::nothing new in inbox/"; exit 0; fi
+
+          # --- venue settings for the .docx conversions ---
+          # venue.json is the file the GalleyTeX web app writes with "Export venue settings" (format "ei-typesetter-conference");
+          # a flat {conference, short, year, dates, location, isbn} object is accepted too.
+          venue=()
+          if [ -f venue.json ]; then
+            mapfile -t venue < <(jq -r '(if (.conference|type)=="object" then .conference else . end) as $c
+              | { conference: ($c.name // $c.conference), short: ($c.shortName // $c.short), year: $c.year,
+                  dates: $c.dates, location: $c.location, isbn: $c.isbn }
+              | to_entries[] | "--\(.key)", "\(.value // "")"' venue.json)   # all six always passed: empty in venue.json means empty in the paper
+          fi
+          lang=$(jq -r '.lang // "zh"' venue.json 2>/dev/null || echo zh)
+          echo "venue: ${venue[*]:-(none, converter defaults)}"
+
+          mkdir -p out; failed=0
+          SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          { echo "## GalleyTeX inbox — ${#files[@]} manuscript(s)"; echo
+            echo "| Manuscript | Source | Checklist warnings | Pages | LaTeX errors | Result |"; echo "|---|---|---|---|---|---|"; } >> "$SUMMARY"
+
+          for f in "${files[@]}"; do
+            [ -f "$f" ] || continue
+            name=$(basename "$f"); name="${name%.*}"
+            ext="${f##*.}"; ext="${ext,,}"
+            echo "::group::$name ($ext)"
+            rm -rf "build/$name"; mkdir -p "build/$name" "out/$name"
+            warn="–"
+            if [ "$ext" = "docx" ]; then
+              # 1. Word -> LaTeX project, headless (same code path as the browser app)
+              if ! node app/scripts/headless_run.js app/galleytex_studio.html "$f" "build/$name" "${venue[@]}" --lang "$lang" > "out/$name/convert-output.txt" 2>&1 \
+                 || [ ! -f "build/$name/project.zip" ]; then
+                echo "::error::$name: conversion failed (see convert-output.txt)"; tail -n 20 "out/$name/convert-output.txt"
+                echo "| $name | docx | – | – | – | ❌ conversion failed |" >> "$SUMMARY"; failed=1; echo "::endgroup::"; continue
+              fi
+              cp "build/$name/project.zip" "out/$name/project.zip"
+              cp "build/$name/ui_report.json" "out/$name/" 2>/dev/null || true
+              warn=$(jq '[.checks[] | select(startswith("!"))] | length' "build/$name/ui_report.json" 2>/dev/null || echo "?")
+              zip="build/$name/project.zip"
+            else
+              zip="$f"
+            fi
+            # 2. LaTeX project -> PDF
+            mkdir -p "build/$name/proj"; unzip -q -o "$zip" -d "build/$name/proj"
+            main=$(find "build/$name/proj" -name main.tex | head -n 1)
+            if [ -z "$main" ]; then echo "::error::$name: no main.tex in project"; echo "| $name | $ext | $warn | – | – | ❌ no main.tex |" >> "$SUMMARY"; failed=1; echo "::endgroup::"; continue; fi
+            dir=$(dirname "$main")
+            (cd "$dir" && latexmk -xelatex -interaction=nonstopmode main.tex) > "out/$name/latexmk-output.txt" 2>&1 || true
+            cp "$dir/main.log" "out/$name/" 2>/dev/null || true
+            if [ -f "$dir/main.pdf" ]; then
+              cp "$dir/main.pdf" "out/$name/$name.pdf"
+              pages=$(grep -o 'Output written on [^(]*([0-9]* page' "$dir/main.log" | grep -o '[0-9]*' | tail -n 1)
+              errs=$(grep -c '^!' "$dir/main.log" || true)
+              echo "$name: $warn checklist warning(s), PDF $pages page(s), $errs LaTeX error(s)"
+              if [ "$errs" = "0" ]; then echo "| $name | $ext | $warn | $pages | 0 | ✅ |" >> "$SUMMARY"
+              else echo "| $name | $ext | $warn | $pages | $errs | ⚠️ PDF with errors |" >> "$SUMMARY"; echo "::warning::$name: $errs LaTeX error(s)"; grep -n -A3 '^!' "$dir/main.log" | head -n 40; fi
+            else
+              echo "::error::$name: no PDF produced"; echo "| $name | $ext | $warn | – | $(grep -c '^!' "$dir/main.log" 2>/dev/null || echo '?') | ❌ no PDF |" >> "$SUMMARY"
+              grep -n -A3 '^!' "$dir/main.log" | head -n 40 || true; failed=1
+            fi
+            echo "::endgroup::"
+          done
+          { echo; echo "_Checklist warnings = items the converter flagged for a human (inferred headings, unconverted objects, missing countries…); open those manuscripts in the GalleyTeX app to proofread, export the ZIP and drop it back into inbox/._"; } >> "$SUMMARY"
+          exit $failed
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: galleytex-output
+          path: out/
+          retention-days: 30
