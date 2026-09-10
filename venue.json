@@ -1,0 +1,16 @@
+{
+  "format": "ei-typesetter-conference",
+  "version": 1,
+  "conference": {
+    "name": "International Conference on Implementing Generative AI for Telecommunication and Digital Innovation 2026",
+    "shortName": "GAITDI 2026",
+    "year": "2026",
+    "dates": "",
+    "location": "",
+    "isbn": "",
+    "format": "acmsmall",
+    "copyright": "acmlicensed",
+    "folios": false
+  },
+  "lang": "zh"
+}

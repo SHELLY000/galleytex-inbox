@@ -1,0 +1,8 @@
+# local scratch if someone runs the pipeline by hand
+app/
+build/
+out/
+regression_out/
+headless_out/
+node_modules/
+.DS_Store
