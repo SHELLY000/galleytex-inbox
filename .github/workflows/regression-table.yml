@@ -1,0 +1,72 @@
+name: Regression table
+
+# Runs GalleyTeX's regression harness (scripts/regression.js) over every .docx in inbox/ on a hosted runner:
+# headless conversion + XeLaTeX compile + one CSV line per manuscript. No local software needed.
+# Start it by hand: Actions -> "Regression table" -> Run workflow. Result: the CSV in the run Summary and in the
+# "regression-table" artifact (with regression_out/<name>/proj/main.log for every manuscript).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_label:
+        description: "Label for the CSV file, e.g. v0.3.1"
+        required: true
+        default: "v0.3.1"
+
+env:
+  APP_REPO: SHELLY000/wordtolatexZL
+  APP_REF: v0.3.1
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the converter at ${{ env.APP_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.APP_REPO }}
+          ref: ${{ env.APP_REF }}
+          path: app
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build the converter
+        run: cd app && npm ci --no-audit --no-fund && npm run build
+
+      - name: Install XeLaTeX (acmart fonts + CJK)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-xetex texlive-latex-extra texlive-fonts-recommended texlive-fonts-extra \
+            texlive-bibtex-extra texlive-lang-chinese latexmk fonts-linuxlibertine fonts-noto-cjk
+
+      - name: Run the regression harness on inbox/
+        run: |
+          shopt -s nullglob
+          files=(inbox/*.docx)
+          if [ ${#files[@]} -eq 0 ]; then echo "::error::no .docx in inbox/"; exit 1; fi
+          mkdir -p out
+          # regression.js takes a directory: converts every .docx in it, compiles each project, prints one CSV line per file
+          (cd app && node scripts/regression.js ../inbox --compile --out ../out/regression_out) | tee "out/manuscripts_${{ github.event.inputs.version_label }}.csv"
+          {
+            echo "## Regression table — ${{ github.event.inputs.version_label }} (converter ${{ env.APP_REF }})"; echo
+            echo '```'; cat "out/manuscripts_${{ github.event.inputs.version_label }}.csv"; echo '```'; echo
+            echo "_latex_errors must be 0 for every row; HEADLESS_FAILED means the conversion itself failed — see regression_out/<name>/ in the artifact._"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # fail the run if any manuscript has LaTeX errors or failed headless
+          if tail -n +2 "out/manuscripts_${{ github.event.inputs.version_label }}.csv" | awk -F, '{ if ($3 != "0") { print "::error::" $1 ": latex_errors=" $3; bad=1 } } END { exit bad }'; then echo "all manuscripts compiled with 0 errors"; fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: regression-table
+          path: |
+            out/*.csv
+            out/regression_out/**/proj/main.log
+            out/regression_out/**/proj/main.pdf
+            out/regression_out/**/ui_report.json
+          retention-days: 30
